@@ -1,300 +1,397 @@
-# app.py
-import os
+
+import io
 import fnmatch
 import zipfile
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-# -----------------------------
-# Config
-# -----------------------------
-st.set_page_config(page_title="Time Series Anomaly Labeler", layout="wide")
-
-# If you keep the uploaded files next to app.py, these defaults will work.
-# Otherwise set them in the sidebar.
-DEFAULT_LABELS_CSV = "labels.csv"
-DEFAULT_ZIP_PATH = "phase_1.zip"
-DEFAULT_FOLDER_IN_ZIP = "phase_1/"
-
-test_color = "rgba(76, 114, 176, 0.9)"   # blue
-train_color = "rgba(221, 132, 82, 0.9)"  # orange
-anom_color = "rgba(44, 160, 44, 1.0)"    # green
+# Colors (RGBA)
+TEST_COLOR  = "rgba(76, 114, 176, 0.9)"   # blue
+TRAIN_COLOR = "rgba(221, 132, 82, 0.9)"   # orange
+ANOM_COLOR  = "rgba(44, 160, 44, 0.35)"   # green fill
+ANOM_LINE   = "rgba(44, 160, 44, 1.0)"    # green line
 
 
 # -----------------------------
-# Data helpers
+# Helpers
 # -----------------------------
-@st.cache_data(show_spinner=False)
-def load_locations(labels_csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(labels_csv_path)
-    if "Name" not in df.columns or "Start" not in df.columns or "End" not in df.columns:
-        raise ValueError("labels.csv must contain columns: Name, Start, End")
+def _list_top_folders(zf: zipfile.ZipFile) -> List[str]:
+    """Return top-level folder names in the zip (with trailing slash)."""
+    folders = set()
+    for name in zf.namelist():
+        if "/" in name:
+            top = name.split("/", 1)[0] + "/"
+            folders.add(top)
+    return sorted(folders)
+
+
+def _find_labels_candidates(zf: zipfile.ZipFile) -> List[str]:
+    return [n for n in zf.namelist() if n.lower().endswith("labels.csv")]
+
+
+def _read_labels_from_bytes(csv_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(csv_bytes))
+    # Expect columns: Name, Start, End
+    if "Name" not in df.columns:
+        raise ValueError("labels.csv must have a 'Name' column.")
+    if "Start" not in df.columns or "End" not in df.columns:
+        raise ValueError("labels.csv must have 'Start' and 'End' columns.")
     df = df.copy()
+    df["Start"] = pd.to_numeric(df["Start"], errors="coerce").fillna(-1).astype(int)
+    df["End"]   = pd.to_numeric(df["End"], errors="coerce").fillna(-1).astype(int)
     df.set_index("Name", inplace=True)
     return df
 
 
-@st.cache_data(show_spinner=False)
-def list_series_files(zip_path: str, folder_in_zip: str) -> np.ndarray:
-    with zipfile.ZipFile(zip_path) as zf:
-        files = np.sort([
-            name[len(folder_in_zip):]
-            for name in zf.namelist()
-            if name.startswith(folder_in_zip)
-            and fnmatch.fnmatch(name, "*.csv")
-            and not name.endswith("labels.csv")
-        ])
-    return files
+def _parse_series_name_and_test_start(file_name: str) -> Tuple[str, int]:
+    """
+    file_name example: "000_Anomaly_2500.csv"
+    Returns: (name_without_ext, test_start)
+    """
+    base = file_name.rsplit("/", 1)[-1]          # strip folders if present
+    name_no_ext = base.rsplit(".", 1)[0]
+    splits = name_no_ext.split("_")
+    test_start = int(splits[-1])
+    return name_no_ext, test_start
 
 
-def parse_test_start_from_filename(file: str) -> int:
-    # file like: "000_Anomaly_2500.csv"
-    file_name = os.path.splitext(os.path.basename(file))[0]
-    splits = file_name.split("_")
-    return int(splits[-1])
+def _read_series_from_zip(zf: zipfile.ZipFile, internal_path: str) -> np.ndarray:
+    with zf.open(internal_path) as f:
+        data = pd.read_csv(f, header=None).to_numpy().flatten()
+    return data.astype(float)
 
 
-@st.cache_data(show_spinner=False)
-def read_series(zip_path: str, folder_in_zip: str, file: str) -> tuple[str, int, np.ndarray]:
-    internal_name = folder_in_zip + file
-    series_name = os.path.splitext(os.path.basename(file))[0]
-    test_start = parse_test_start_from_filename(file)
-
-    with zipfile.ZipFile(zip_path) as zf:
-        with zf.open(internal_name) as f:
-            data = pd.read_csv(f, header=None).to_numpy().flatten().astype(float)
-
-    return series_name, test_start, data
-
-
-def build_figure(series_name: str, test_start: int, data: np.ndarray, anomaly: tuple[int, int]) -> go.Figure:
-    x = np.arange(len(data))
+def build_figure(data: np.ndarray, test_start: int, anomaly: Tuple[int, int], title: str) -> go.Figure:
+    n = len(data)
+    x_all = np.arange(n)
 
     fig = go.Figure()
 
-    # Train trace
-    fig.add_trace(go.Scatter(
-        x=x[:test_start],
-        y=data[:test_start],
-        mode="lines",
-        line=dict(width=1, color=train_color),
-        name="Train"
-    ))
+    # Train
+    if test_start > 0:
+        fig.add_trace(
+            go.Scatter(
+                x=x_all[:test_start],
+                y=data[:test_start],
+                mode="lines",
+                line=dict(width=1, color=TRAIN_COLOR),
+                name="train",
+                hovertemplate="t=%{x}<br>y=%{y}<extra></extra>",
+            )
+        )
 
-    # Test trace
-    fig.add_trace(go.Scatter(
-        x=x[test_start:],
-        y=data[test_start:],
-        mode="lines",
-        line=dict(width=1, color=test_color),
-        name="Test"
-    ))
+    # Test
+    if test_start < n:
+        fig.add_trace(
+            go.Scatter(
+                x=x_all[test_start:],
+                y=data[test_start:],
+                mode="lines",
+                line=dict(width=1, color=TEST_COLOR),
+                name="test",
+                hovertemplate="t=%{x}<br>y=%{y}<extra></extra>",
+            )
+        )
 
-    # Test start marker
-    fig.add_vline(
-        x=test_start,
-        line_width=1,
-        line_dash="dot",
-        line_color="gray",
-        annotation_text="test start",
-        annotation_position="top right",
-    )
-
-    # Anomaly highlight
     a0, a1 = anomaly
-    if a0 is not None and a1 is not None and a0 >= 0 and a1 > a0:
-        # line overlay
-        fig.add_trace(go.Scatter(
-            x=x[a0:a1],
-            y=data[a0:a1],
-            mode="lines",
-            line=dict(width=2, color=anom_color),
-            name="Anomaly"
-        ))
+    if a0 is not None and a1 is not None and a0 >= 0 and a1 > a0 and a1 <= n:
         # shaded region
         fig.add_vrect(
-            x0=a0, x1=a1,
-            fillcolor="rgba(44,160,44,0.15)",
-            line_width=0
+            x0=a0,
+            x1=a1,
+            fillcolor=ANOM_COLOR,
+            line_width=0,
+            layer="below",
+        )
+        # overlay line for clarity
+        fig.add_trace(
+            go.Scatter(
+                x=x_all[a0:a1],
+                y=data[a0:a1],
+                mode="lines",
+                line=dict(width=2, color=ANOM_LINE),
+                name="anomaly",
+                hovertemplate="ANOM t=%{x}<br>y=%{y}<extra></extra>",
+            )
         )
 
     fig.update_layout(
-        title=f"{series_name} — Train/Test with Anomaly Labels",
-        margin=dict(l=10, r=10, t=50, b=10),
-        height=520,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        title=title,
+        margin=dict(l=10, r=10, t=45, b=10),
+        showlegend=False,
         paper_bgcolor="white",
         plot_bgcolor="white",
+        xaxis=dict(
+            title="t",
+            showgrid=False,
+            ticks="inside",
+            rangeslider=dict(visible=True),
+            type="linear",
+        ),
+        yaxis=dict(
+            title="value",
+            showgrid=False,
+            ticks="inside",
+        ),
+        height=520,
     )
-
-    # Interactive zoom + range slider
-    fig.update_xaxes(
-        rangeslider=dict(visible=True),
-        type="linear",
-        showgrid=False
-    )
-    fig.update_yaxes(showgrid=False)
-
     return fig
 
 
-def clamp_anomaly(a0: int, a1: int, n: int) -> tuple[int, int]:
-    if n <= 0:
-        return -1, -1
-    a0 = int(max(0, min(a0, n - 1)))
-    a1 = int(max(0, min(a1, n)))
-    if a1 <= a0:
-        a1 = min(n, a0 + 1)
-    return a0, a1
+def init_state():
+    if "zip_bytes" not in st.session_state:
+        st.session_state.zip_bytes = None
+    if "zip_name" not in st.session_state:
+        st.session_state.zip_name = None
+    if "folder_in_zip" not in st.session_state:
+        st.session_state.folder_in_zip = None
+    if "labels_df" not in st.session_state:
+        st.session_state.labels_df = None  # original labels from file (if any)
+    if "labels_overrides" not in st.session_state:
+        st.session_state.labels_overrides = {}  # Dict[name, (start,end)]
+
+
+def get_effective_anomaly(name: str, labels_df: Optional[pd.DataFrame]) -> Tuple[int, int]:
+    # user override first
+    if name in st.session_state.labels_overrides:
+        return st.session_state.labels_overrides[name]
+    # else from labels_df
+    if labels_df is not None and name in labels_df.index:
+        row = labels_df.loc[name]
+        return int(row["Start"]), int(row["End"])
+    return -1, -1
+
+
+def set_override(name: str, start: int, end: int):
+    st.session_state.labels_overrides[name] = (int(start), int(end))
+
+
+def build_export_labels(series_names: List[str], labels_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    rows = []
+    for name in series_names:
+        a0, a1 = get_effective_anomaly(name, labels_df)
+        rows.append({"Name": name, "Start": int(a0), "End": int(a1)})
+    out = pd.DataFrame(rows)
+    return out
 
 
 # -----------------------------
-# UI
+# App
 # -----------------------------
-st.title("Time Series Anomaly Labeler")
+st.set_page_config(page_title="Time Series Anomaly Labeler", layout="wide")
+init_state()
+
+st.title("Time Series Anomaly Labeler (Zip Upload + Interactive Plotly)")
 
 with st.sidebar:
-    st.header("Data sources")
-    zip_path = st.text_input("ZIP path", value=DEFAULT_ZIP_PATH)
-    folder_in_zip = st.text_input("Folder in ZIP", value=DEFAULT_FOLDER_IN_ZIP)
-    labels_csv_path = st.text_input("labels.csv path", value=DEFAULT_LABELS_CSV)
+    st.header("1) Upload data")
+    zup = st.file_uploader("Upload a zip file containing CSV time series (and optionally labels.csv)", type=["zip"])
+    lup = st.file_uploader("Optional: upload labels.csv (overrides any labels.csv inside the zip)", type=["csv"])
 
-    st.caption("Tip: keep `phase_1.zip` and `labels.csv` next to `app.py` or set paths here.")
+    if zup is not None:
+        st.session_state.zip_bytes = zup.getvalue()
+        st.session_state.zip_name = zup.name
 
-# Validate inputs early
-if not os.path.exists(zip_path):
-    st.error(f"ZIP not found: {zip_path}")
+    # Load zip if present
+    zf = None
+    if st.session_state.zip_bytes is not None:
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(st.session_state.zip_bytes))
+        except zipfile.BadZipFile:
+            st.error("That does not look like a valid zip file.")
+            zf = None
+
+    # Determine folder_in_zip and file list
+    folder_in_zip = None
+    series_files_internal = []
+    series_files_display = []
+    if zf is not None:
+        folders = _list_top_folders(zf)
+        # If there are folders, ask user which to use; else use root
+        if folders:
+            folder_in_zip = st.selectbox("Folder inside zip", folders, index=0)
+        else:
+            folder_in_zip = ""  # root
+
+        # collect series files
+        for name in zf.namelist():
+            if folder_in_zip and not name.startswith(folder_in_zip):
+                continue
+            if fnmatch.fnmatch(name.lower(), "*.csv") and not name.lower().endswith("labels.csv"):
+                series_files_internal.append(name)
+                # display name stripped of folder prefix for readability
+                display = name[len(folder_in_zip):] if folder_in_zip else name
+                series_files_display.append(display)
+
+        # Keep stable ordering
+        order = np.argsort(series_files_display)
+        series_files_internal = [series_files_internal[i] for i in order]
+        series_files_display  = [series_files_display[i] for i in order]
+
+        st.session_state.folder_in_zip = folder_in_zip
+
+    st.divider()
+    st.header("2) Labels source")
+    labels_df = None
+
+    # labels.csv from uploader
+    if lup is not None:
+        try:
+            labels_df = _read_labels_from_bytes(lup.getvalue())
+            st.success("Loaded labels.csv from upload.")
+        except Exception as e:
+            st.error(f"Could not read uploaded labels.csv: {e}")
+
+    # else try to load labels.csv from zip
+    if labels_df is None and zf is not None:
+        candidates = _find_labels_candidates(zf)
+        if candidates:
+            # prefer labels.csv inside selected folder if possible
+            preferred = None
+            if st.session_state.folder_in_zip is not None:
+                for c in candidates:
+                    if c.startswith(st.session_state.folder_in_zip):
+                        preferred = c
+                        break
+            pick = preferred or candidates[0]
+            try:
+                with zf.open(pick) as f:
+                    labels_df = _read_labels_from_bytes(f.read())
+                st.info(f"Loaded labels from zip: {pick}")
+            except Exception as e:
+                st.warning(f"Found labels.csv in zip but couldn't read it ({pick}): {e}")
+
+    st.session_state.labels_df = labels_df
+
+    st.divider()
+    st.header("3) Export")
+    export_name = st.text_input("Export filename", value="labels_updated.csv")
+    st.caption("Exports current labels (original + your edits).")
+
+# Main area
+if zf is None:
+    st.info("Upload a zip file in the sidebar to begin.")
     st.stop()
 
-if not os.path.exists(labels_csv_path):
-    st.error(f"labels.csv not found: {labels_csv_path}")
+if not series_files_internal:
+    st.warning("No CSV time series files found in the selected zip/folder (excluding labels.csv).")
     st.stop()
 
-try:
-    locations = load_locations(labels_csv_path)
-except Exception as e:
-    st.error(f"Failed to read labels.csv: {e}")
-    st.stop()
+col_left, col_right = st.columns([0.35, 0.65], gap="large")
 
-try:
-    file_list = list_series_files(zip_path, folder_in_zip)
-    if len(file_list) == 0:
-        st.error("No series CSV files found inside the ZIP (check folder name).")
+with col_left:
+    st.subheader("Select & edit")
+    idx = st.selectbox(
+        "Time series file",
+        options=list(range(len(series_files_display))),
+        format_func=lambda i: series_files_display[i],
+    )
+    internal_path = series_files_internal[idx]
+    display_name = series_files_display[idx]
+
+    # Read series
+    try:
+        data = _read_series_from_zip(zf, internal_path)
+        name, test_start = _parse_series_name_and_test_start(display_name)
+    except Exception as e:
+        st.error(f"Could not read {display_name}: {e}")
         st.stop()
-except Exception as e:
-    st.error(f"Failed to list series from ZIP: {e}")
-    st.stop()
-
-# Session state for editable labels
-if "labels_map" not in st.session_state:
-    # Initialize from labels.csv
-    st.session_state.labels_map = {
-        idx: (int(row["Start"]), int(row["End"]))
-        for idx, row in locations.iterrows()
-    }
-
-# Select series
-colA, colB = st.columns([2, 1])
-with colA:
-    selected_file = st.selectbox("Select a time series", file_list.tolist())
-with colB:
-    st.write("")
-    st.write("")
-    if st.button("Reset ALL edits to labels.csv"):
-        st.session_state.labels_map = {
-            idx: (int(row["Start"]), int(row["End"]))
-            for idx, row in locations.iterrows()
-        }
-        st.success("Edits reset.")
-
-series_name, test_start, data = read_series(zip_path, folder_in_zip, selected_file)
-
-# Get current label (edited if present, else fallback)
-curr = st.session_state.labels_map.get(series_name, (-1, -1))
-curr_start, curr_end = int(curr[0]), int(curr[1])
-
-# Editor controls
-st.subheader("Edit anomaly annotation")
-
-left, right = st.columns([1.2, 2.8], vertical_alignment="top")
-
-with left:
-    has_anomaly = st.checkbox("This series has an anomaly", value=(curr_start >= 0 and curr_end > curr_start))
 
     n = len(data)
-    if has_anomaly:
-        # Provide a single range slider for start/end
-        # Ensure sensible defaults if missing
-        if curr_start < 0 or curr_end <= curr_start:
-            curr_start, curr_end = 0, min(n, max(1, n // 20))
+    a0, a1 = get_effective_anomaly(name, st.session_state.labels_df)
 
-        a0, a1 = st.slider(
-            "Anomaly range (start, end)",
-            min_value=0,
-            max_value=max(1, n - 1),
-            value=(int(curr_start), int(min(curr_end, n - 1))),
-            help="Drag the handles to change the anomaly segment."
-        )
+    st.markdown(f"**Series:** `{name}`")
+    st.markdown(f"**Length:** `{n}`")
+    st.markdown(f"**Test starts at index:** `{test_start}`")
 
-        # End is exclusive in many labeling schemes; here we treat it as exclusive.
-        # Make end at least start+1 and at most n.
-        a0, a1 = clamp_anomaly(a0, a1 + 1, n)  # convert slider's inclusive end-ish to exclusive
-        st.caption(f"Stored as Start={a0}, End={a1} (End is exclusive).")
-
-        st.session_state.labels_map[series_name] = (a0, a1)
+    has_anomaly = st.checkbox("Has anomaly", value=(a0 >= 0 and a1 > a0), help="Uncheck to remove anomaly label.")
+    if not has_anomaly:
+        a0, a1 = -1, -1
+        set_override(name, a0, a1)
     else:
-        st.session_state.labels_map[series_name] = (-1, -1)
-        st.caption("Stored as Start=-1, End=-1 (no anomaly).")
+        # Clamp defaults to valid range
+        if not (0 <= a0 < n):
+            a0 = max(0, min(n - 1, a0 if a0 >= 0 else 0))
+        if not (0 <= a1 <= n) or a1 <= a0:
+            a1 = min(n, a0 + 1)
 
-    # Optional: quick numeric fine-tuning
-    with st.expander("Fine-tune with exact numbers"):
-        a0_in = st.number_input("Start (inclusive)", min_value=-1, max_value=n, value=int(st.session_state.labels_map[series_name][0]))
-        a1_in = st.number_input("End (exclusive)", min_value=-1, max_value=n, value=int(st.session_state.labels_map[series_name][1]))
-        if st.button("Apply exact values"):
-            if a0_in < 0 or a1_in < 0:
-                st.session_state.labels_map[series_name] = (-1, -1)
-            else:
-                st.session_state.labels_map[series_name] = clamp_anomaly(int(a0_in), int(a1_in), n)
-            st.success("Applied.")
-
-    if st.button("Reset this series to labels.csv"):
-        if series_name in locations.index:
-            row = locations.loc[series_name]
-            st.session_state.labels_map[series_name] = (int(row["Start"]), int(row["End"]))
+        # Slider for range
+        rng = st.slider(
+            "Anomaly range [start, end)",
+            min_value=0,
+            max_value=n,
+            value=(int(a0), int(a1)),
+            step=1,
+            help="Move the handles to adjust the anomaly segment.",
+        )
+        a0_new, a1_new = int(rng[0]), int(rng[1])
+        if a1_new <= a0_new:
+            st.warning("End must be greater than start.")
         else:
-            st.session_state.labels_map[series_name] = (-1, -1)
-        st.success("Reset series label.")
+            set_override(name, a0_new, a1_new)
+            a0, a1 = a0_new, a1_new
 
-with right:
-    anomaly = st.session_state.labels_map.get(series_name, (-1, -1))
-    fig = build_figure(series_name, test_start, data, anomaly)
-    st.plotly_chart(fig, use_container_width=True)
+    # Quick buttons
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("Clear label"):
+            set_override(name, -1, -1)
+            st.rerun()
+    with b2:
+        if st.button("Set to test window"):
+            # common heuristic: anomalies in test region
+            set_override(name, int(test_start), int(n))
+            st.rerun()
+    with b3:
+        if st.button("Reset to original"):
+            if st.session_state.labels_df is not None and name in st.session_state.labels_df.index:
+                row = st.session_state.labels_df.loc[name]
+                set_override(name, int(row["Start"]), int(row["End"]))
+            else:
+                set_override(name, -1, -1)
+            st.rerun()
 
-# Export section
-st.subheader("Export labels")
-
-# Build updated labels DataFrame:
-# keep the union of original label rows + any new series labels created during session
-all_names = sorted(set(locations.index.tolist()) | set(st.session_state.labels_map.keys()))
-export_df = pd.DataFrame(
-    {
-        "Name": all_names,
-        "Start": [int(st.session_state.labels_map.get(nm, (-1, -1))[0]) for nm in all_names],
-        "End": [int(st.session_state.labels_map.get(nm, (-1, -1))[1]) for nm in all_names],
-    }
-)
-
-col1, col2 = st.columns([1, 2])
-with col1:
-    st.download_button(
-        label="Download labels_updated.csv",
-        data=export_df.to_csv(index=False).encode("utf-8"),
-        file_name="labels_updated.csv",
-        mime="text/csv",
+with col_right:
+    st.subheader("Interactive plot")
+    fig = build_figure(
+        data=data,
+        test_start=test_start,
+        anomaly=(a0, a1),
+        title="Train (orange) + Test (blue) with Anomaly (green)",
     )
 
-with col2:
-    st.dataframe(export_df, use_container_width=True, height=220)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "scrollZoom": True,
+            "displayModeBar": True,
+            "responsive": True,
+        },
+    )
+    st.caption("Tip: Use mouse wheel / trackpad to zoom, click-drag to pan, and the range slider to quickly navigate.")
+
+# Export section (bottom)
+st.divider()
+st.subheader("Export labels")
+
+# Create list of series "names" (without extension, without folder)
+series_names = []
+for disp in series_files_display:
+    nm, _ = _parse_series_name_and_test_start(disp)
+    series_names.append(nm)
+
+export_df = build_export_labels(series_names, st.session_state.labels_df)
+
+csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download labels CSV",
+    data=csv_bytes,
+    file_name=export_name if export_name.endswith(".csv") else (export_name + ".csv"),
+    mime="text/csv",
+)
+st.dataframe(export_df, use_container_width=True, height=240)
