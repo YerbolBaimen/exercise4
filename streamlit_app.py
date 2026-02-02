@@ -1,5 +1,6 @@
 
 import io
+import hashlib
 import fnmatch
 import zipfile
 from typing import Dict, Tuple, Optional, List
@@ -241,7 +242,18 @@ with st.sidebar:
     # labels.csv from uploader
     if lup is not None:
         try:
-            labels_df = _read_labels_from_bytes(lup.getvalue())
+            raw = lup.getvalue()
+            # If a new labels file is uploaded, clear existing edits so the upload truly overrides.
+            new_hash = hashlib.md5(raw).hexdigest()
+            if st.session_state.get("labels_upload_hash") != new_hash:
+                st.session_state["labels_upload_hash"] = new_hash
+                st.session_state.labels_overrides = {}
+                # Also clear per-series widget states so defaults re-initialize from the new labels.
+                for k in list(st.session_state.keys()):
+                    if k.startswith(("has_anom_", "typed_start_", "typed_end_", "slider_", "prev_has_")):
+                        st.session_state.pop(k, None)
+                st.info("New labels.csv detected — cleared previous edits so the uploaded labels take effect.")
+            labels_df = _read_labels_from_bytes(raw)
             st.success("Loaded labels.csv from upload.")
         except Exception as e:
             st.error(f"Could not read uploaded labels.csv: {e}")
@@ -384,9 +396,26 @@ with col_left:
         help="Uncheck to remove anomaly label.",
     )
 
+    # Apply an override only when the user actually toggles the checkbox
+    prev_key = f"prev_has_{name}"
+    if prev_key not in st.session_state:
+        st.session_state[prev_key] = bool(has_anomaly)
+    elif bool(st.session_state[prev_key]) != bool(has_anomaly):
+        # User toggled since last run
+        if not has_anomaly:
+            set_override(name, -1, -1)
+        else:
+            # Re-enable anomaly: use current slider/typed values if present, otherwise fallback to labels
+            start_idx = int(st.session_state.get(slider_key, (0, 1))[0])
+            end_idx = int(st.session_state.get(slider_key, (0, 1))[1])
+            if end_idx <= start_idx:
+                start_idx, end_idx = 0, 1
+            set_override(name, start_idx, end_idx)
+        st.session_state[prev_key] = bool(has_anomaly)
+
     if not has_anomaly:
+        # For display only; do not create an override unless user explicitly toggled/edited.
         a0, a1 = -1, -1
-        set_override(name, a0, a1)
         # Prepare defaults for when the user re-enables anomaly later
         st.session_state[typed_start_key] = 0
         st.session_state[typed_end_key] = 1 if n > 0 else 0
