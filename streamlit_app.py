@@ -319,19 +319,57 @@ with col_left:
         if not (0 <= a1 <= n) or a1 <= a0:
             a1 = min(n, a0 + 1)
 
-        # Slider for range
+        st.markdown("**Edit anomaly boundaries**")
+
+        # Keyboard inputs (precise)
+        c_start, c_end, c_apply = st.columns([1, 1, 1])
+        with c_start:
+            typed_start = st.number_input(
+                "Start",
+                min_value=0,
+                max_value=max(0, n - 1),
+                value=int(a0),
+                step=1,
+                help="Start index (inclusive).",
+                key=f"typed_start_{name}",
+            )
+        with c_end:
+            typed_end = st.number_input(
+                "End",
+                min_value=1,
+                max_value=n,
+                value=int(a1),
+                step=1,
+                help="End index (exclusive). Must be > start.",
+                key=f"typed_end_{name}",
+            )
+        with c_apply:
+            st.write("")
+            st.write("")
+            apply_typed = st.button("Apply typed range", use_container_width=True)
+
+        if apply_typed:
+            if int(typed_end) <= int(typed_start):
+                st.error("End must be greater than start.")
+            else:
+                set_override(name, int(typed_start), int(typed_end))
+                st.rerun()
+
+        # Slider (fast adjustments)
         rng = st.slider(
             "Anomaly range [start, end)",
             min_value=0,
             max_value=n,
             value=(int(a0), int(a1)),
             step=1,
-            help="Move the handles to adjust the anomaly segment.",
+            help="Drag the handles to adjust quickly. Use the number inputs above for exact values.",
+            key=f"slider_{name}",
         )
         a0_new, a1_new = int(rng[0]), int(rng[1])
         if a1_new <= a0_new:
             st.warning("End must be greater than start.")
         else:
+            # Update label immediately when slider moves
             set_override(name, a0_new, a1_new)
             a0, a1 = a0_new, a1_new
 
