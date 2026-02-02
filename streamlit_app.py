@@ -308,10 +308,23 @@ with col_left:
     st.markdown(f"**Length:** `{n}`")
     st.markdown(f"**Test starts at index:** `{test_start}`")
 
-    has_anomaly = st.checkbox("Has anomaly", value=(a0 >= 0 and a1 > a0), help="Uncheck to remove anomaly label.")
+    has_key = f"has_anom_{name}"
+    default_has = (a0 >= 0 and a1 > a0)
+    if has_key not in st.session_state:
+        st.session_state[has_key] = default_has
+
+    has_anomaly = st.checkbox(
+        "Has anomaly",
+        key=has_key,
+        help="Uncheck to remove anomaly label.",
+    )
     if not has_anomaly:
         a0, a1 = -1, -1
         set_override(name, a0, a1)
+        # Keep editor widget states consistent (if they exist)
+        st.session_state[f"typed_start_{name}"] = 0
+        st.session_state[f"typed_end_{name}"] = 1 if n > 0 else 0
+        st.session_state[f"slider_{name}"] = (0, 1 if n > 0 else 0)
     else:
         # Clamp defaults to valid range
         if not (0 <= a0 < n):
@@ -378,19 +391,42 @@ with col_left:
     with b1:
         if st.button("Clear label"):
             set_override(name, -1, -1)
+            st.session_state[has_key] = False
+            st.session_state[f"typed_start_{name}"] = 0
+            st.session_state[f"typed_end_{name}"] = 1 if n > 0 else 0
+            st.session_state[f"slider_{name}"] = (0, 1 if n > 0 else 0)
             st.rerun()
     with b2:
         if st.button("Set to test window"):
-            # common heuristic: anomalies in test region
-            set_override(name, int(test_start), int(n))
+            # Common heuristic: anomalies in test region
+            start, end = int(test_start), int(n)
+            set_override(name, start, end)
+            # Ensure UI reflects this immediately
+            st.session_state[has_key] = True
+            st.session_state[f"typed_start_{name}"] = start
+            st.session_state[f"typed_end_{name}"] = end
+            st.session_state[f"slider_{name}"] = (start, end)
             st.rerun()
     with b3:
         if st.button("Reset to original"):
             if st.session_state.labels_df is not None and name in st.session_state.labels_df.index:
                 row = st.session_state.labels_df.loc[name]
-                set_override(name, int(row["Start"]), int(row["End"]))
+                start, end = int(row["Start"]), int(row["End"])
+                set_override(name, start, end)
+                st.session_state[has_key] = (start >= 0 and end > start)
+                # Sync widgets
+                st.session_state[f"typed_start_{name}"] = max(0, start) if start >= 0 else 0
+                st.session_state[f"typed_end_{name}"] = max(1, end) if end > 0 else 1
+                st.session_state[f"slider_{name}"] = (
+                    int(max(0, start)) if start >= 0 else 0,
+                    int(min(n, max(1, end))) if end > 0 else 1,
+                )
             else:
                 set_override(name, -1, -1)
+                st.session_state[has_key] = False
+                st.session_state[f"typed_start_{name}"] = 0
+                st.session_state[f"typed_end_{name}"] = 1 if n > 0 else 0
+                st.session_state[f"slider_{name}"] = (0, 1 if n > 0 else 0)
             st.rerun()
 
 with col_right:
