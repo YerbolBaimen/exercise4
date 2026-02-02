@@ -308,25 +308,93 @@ with col_left:
     st.markdown(f"**Length:** `{n}`")
     st.markdown(f"**Test starts at index:** `{test_start}`")
 
+
+    # Keys for widgets (per-series)
     has_key = f"has_anom_{name}"
+    typed_start_key = f"typed_start_{name}"
+    typed_end_key = f"typed_end_{name}"
+    slider_key = f"slider_{name}"
+
+    # Initialize widget defaults from the effective label (original + overrides)
     default_has = (a0 >= 0 and a1 > a0)
     if has_key not in st.session_state:
         st.session_state[has_key] = default_has
+    if typed_start_key not in st.session_state:
+        st.session_state[typed_start_key] = int(max(0, a0)) if default_has else 0
+    if typed_end_key not in st.session_state:
+        st.session_state[typed_end_key] = int(min(n, a1)) if default_has else (1 if n > 0 else 0)
+    if slider_key not in st.session_state:
+        st.session_state[slider_key] = (
+            int(st.session_state[typed_start_key]),
+            int(st.session_state[typed_end_key]),
+        )
+
+    # Quick buttons (must be above the widgets they control)
+    st.markdown("**Quick actions**")
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("Clear label"):
+            set_override(name, -1, -1)
+            st.session_state[has_key] = False
+            st.session_state[typed_start_key] = 0
+            st.session_state[typed_end_key] = 1 if n > 0 else 0
+            st.session_state[slider_key] = (0, 1 if n > 0 else 0)
+            st.rerun()
+    with b2:
+        if st.button("Set to test window"):
+            start_idx, end_idx = int(test_start), int(n)
+            set_override(name, start_idx, end_idx)
+            st.session_state[has_key] = True
+            st.session_state[typed_start_key] = start_idx
+            st.session_state[typed_end_key] = end_idx
+            st.session_state[slider_key] = (start_idx, end_idx)
+            st.rerun()
+    with b3:
+        if st.button("Reset to original"):
+            if st.session_state.labels_df is not None and name in st.session_state.labels_df.index:
+                row = st.session_state.labels_df.loc[name]
+                start_idx, end_idx = int(row["Start"]), int(row["End"])
+                set_override(name, start_idx, end_idx)
+                has = (start_idx >= 0 and end_idx > start_idx)
+                st.session_state[has_key] = has
+                if has:
+                    st.session_state[typed_start_key] = max(0, start_idx)
+                    st.session_state[typed_end_key] = min(n, end_idx) if end_idx > 0 else 1
+                    st.session_state[slider_key] = (
+                        int(st.session_state[typed_start_key]),
+                        int(st.session_state[typed_end_key]),
+                    )
+                else:
+                    st.session_state[typed_start_key] = 0
+                    st.session_state[typed_end_key] = 1 if n > 0 else 0
+                    st.session_state[slider_key] = (0, 1 if n > 0 else 0)
+            else:
+                set_override(name, -1, -1)
+                st.session_state[has_key] = False
+                st.session_state[typed_start_key] = 0
+                st.session_state[typed_end_key] = 1 if n > 0 else 0
+                st.session_state[slider_key] = (0, 1 if n > 0 else 0)
+            st.rerun()
+
+    st.divider()
 
     has_anomaly = st.checkbox(
         "Has anomaly",
         key=has_key,
         help="Uncheck to remove anomaly label.",
     )
+
     if not has_anomaly:
         a0, a1 = -1, -1
         set_override(name, a0, a1)
-        # Keep editor widget states consistent (if they exist)
-        st.session_state[f"typed_start_{name}"] = 0
-        st.session_state[f"typed_end_{name}"] = 1 if n > 0 else 0
-        st.session_state[f"slider_{name}"] = (0, 1 if n > 0 else 0)
+        # Prepare defaults for when the user re-enables anomaly later
+        st.session_state[typed_start_key] = 0
+        st.session_state[typed_end_key] = 1 if n > 0 else 0
+        st.session_state[slider_key] = (0, 1 if n > 0 else 0)
     else:
-        # Clamp defaults to valid range
+        # Clamp to valid range
+        a0 = int(st.session_state.get(typed_start_key, a0))
+        a1 = int(st.session_state.get(typed_end_key, a1))
         if not (0 <= a0 < n):
             a0 = max(0, min(n - 1, a0 if a0 >= 0 else 0))
         if not (0 <= a1 <= n) or a1 <= a0:
@@ -344,7 +412,7 @@ with col_left:
                 value=int(a0),
                 step=1,
                 help="Start index (inclusive).",
-                key=f"typed_start_{name}",
+                key=typed_start_key,
             )
         with c_end:
             typed_end = st.number_input(
@@ -354,7 +422,7 @@ with col_left:
                 value=int(a1),
                 step=1,
                 help="End index (exclusive). Must be > start.",
-                key=f"typed_end_{name}",
+                key=typed_end_key,
             )
         with c_apply:
             st.write("")
@@ -366,6 +434,8 @@ with col_left:
                 st.error("End must be greater than start.")
             else:
                 set_override(name, int(typed_start), int(typed_end))
+                # Keep slider in sync (slider not created yet in this run)
+                st.session_state[slider_key] = (int(typed_start), int(typed_end))
                 st.rerun()
 
         # Slider (fast adjustments)
@@ -373,10 +443,10 @@ with col_left:
             "Anomaly range [start, end)",
             min_value=0,
             max_value=n,
-            value=(int(a0), int(a1)),
+            value=tuple(st.session_state.get(slider_key, (int(a0), int(a1)))),
             step=1,
             help="Drag the handles to adjust quickly. Use the number inputs above for exact values.",
-            key=f"slider_{name}",
+            key=slider_key,
         )
         a0_new, a1_new = int(rng[0]), int(rng[1])
         if a1_new <= a0_new:
@@ -386,48 +456,6 @@ with col_left:
             set_override(name, a0_new, a1_new)
             a0, a1 = a0_new, a1_new
 
-    # Quick buttons
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("Clear label"):
-            set_override(name, -1, -1)
-            st.session_state[has_key] = False
-            st.session_state[f"typed_start_{name}"] = 0
-            st.session_state[f"typed_end_{name}"] = 1 if n > 0 else 0
-            st.session_state[f"slider_{name}"] = (0, 1 if n > 0 else 0)
-            st.rerun()
-    with b2:
-        if st.button("Set to test window"):
-            # Common heuristic: anomalies in test region
-            start, end = int(test_start), int(n)
-            set_override(name, start, end)
-            # Ensure UI reflects this immediately
-            st.session_state[has_key] = True
-            st.session_state[f"typed_start_{name}"] = start
-            st.session_state[f"typed_end_{name}"] = end
-            st.session_state[f"slider_{name}"] = (start, end)
-            st.rerun()
-    with b3:
-        if st.button("Reset to original"):
-            if st.session_state.labels_df is not None and name in st.session_state.labels_df.index:
-                row = st.session_state.labels_df.loc[name]
-                start, end = int(row["Start"]), int(row["End"])
-                set_override(name, start, end)
-                st.session_state[has_key] = (start >= 0 and end > start)
-                # Sync widgets
-                st.session_state[f"typed_start_{name}"] = max(0, start) if start >= 0 else 0
-                st.session_state[f"typed_end_{name}"] = max(1, end) if end > 0 else 1
-                st.session_state[f"slider_{name}"] = (
-                    int(max(0, start)) if start >= 0 else 0,
-                    int(min(n, max(1, end))) if end > 0 else 1,
-                )
-            else:
-                set_override(name, -1, -1)
-                st.session_state[has_key] = False
-                st.session_state[f"typed_start_{name}"] = 0
-                st.session_state[f"typed_end_{name}"] = 1 if n > 0 else 0
-                st.session_state[f"slider_{name}"] = (0, 1 if n > 0 else 0)
-            st.rerun()
 
 with col_right:
     st.subheader("Interactive plot")
